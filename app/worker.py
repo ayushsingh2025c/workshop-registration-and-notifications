@@ -15,6 +15,8 @@ log = logging.getLogger("notification-worker")
 MAX_BACKOFF_SECONDS = 60
 STREAM_NAME = "notification-jobs"
 CONSUMER_GROUP = "notification-workers"
+STREAM_CLAIM_IDLE_MS = 60_000
+REDIS_RECONNECT_SECONDS = 5
 
 
 def send_notification(job, member, workshop):
@@ -156,57 +158,117 @@ def publish_pending_jobs(redis_client, session_factory: sessionmaker = SessionLo
 
 
 def consume_stream_once(redis_client, session_factory: sessionmaker = SessionLocal, sender=send_notification) -> bool:
+    consumer = os.getenv("WORKER_NAME", "worker-1")
+    claimed = redis_client.xautoclaim(
+        STREAM_NAME,
+        CONSUMER_GROUP,
+        consumer,
+        min_idle_time=STREAM_CLAIM_IDLE_MS,
+        start_id="0-0",
+        count=1,
+    )
+    entries = claimed[1]
+    if entries:
+        return _handle_stream_entry(
+            redis_client,
+            entries[0][0],
+            entries[0][1],
+            session_factory,
+            sender,
+            STREAM_NAME,
+        )
+
     messages = redis_client.xreadgroup(
         CONSUMER_GROUP,
-        os.getenv("WORKER_NAME", "worker-1"),
+        consumer,
         {STREAM_NAME: ">"},
         count=1,
         block=100,
     )
-    for stream, entries in messages:
-        for message_id, fields in entries:
-            raw_job_id = fields.get("job_id", fields.get(b"job_id"))
-            process_one(session_factory, sender, int(raw_job_id))
-            redis_client.xack(stream, CONSUMER_GROUP, message_id)
-            return True
+    for stream, stream_entries in messages:
+        for message_id, fields in stream_entries:
+            return _handle_stream_entry(
+                redis_client, message_id, fields, session_factory, sender, stream
+            )
     return False
+
+
+def _handle_stream_entry(
+    redis_client,
+    message_id,
+    fields,
+    session_factory: sessionmaker,
+    sender,
+    stream: str = STREAM_NAME,
+) -> bool:
+    raw_job_id = fields.get("job_id", fields.get(b"job_id"))
+    if raw_job_id is None:
+        raise ValueError(f"Stream entry {message_id} has no job_id")
+
+    job_id = int(raw_job_id)
+    process_one(session_factory, sender, job_id)
+    with session_factory() as db:
+        job = db.get(NotificationJob, job_id)
+        # A retryable result is already durable as pending; the relay will
+        # publish it again when next_retry_at is reached.
+        handled = job is None or job.status in {"pending", "succeeded", "failed"}
+    if handled:
+        redis_client.xack(stream, CONSUMER_GROUP, message_id)
+    return handled
+
+
+def connect_redis():
+    import redis
+
+    client = redis.Redis.from_url(
+        os.getenv("REDIS_URL", "redis://127.0.0.1:16380/0"),
+        protocol=2,
+        decode_responses=True,
+    )
+    client.ping()
+    try:
+        client.xgroup_create(STREAM_NAME, CONSUMER_GROUP, id="0", mkstream=True)
+    except redis.exceptions.ResponseError as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+    return client
 
 
 def run_forever():
     recover_stale_jobs()
     redis_client = None
-    try:
-        import redis
-
-        redis_client = redis.Redis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-            protocol=2,
-        )
-        redis_client.ping()
-        try:
-            redis_client.xgroup_create(STREAM_NAME, CONSUMER_GROUP, id="0", mkstream=True)
-        except redis.exceptions.ResponseError as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
-        log.info("Connected to Redis Streams")
-    except Exception:
-        log.warning("Redis Streams unavailable; using durable PostgreSQL polling", exc_info=True)
-        redis_client = None
+    last_recovery = time.monotonic()
+    last_redis_attempt = 0.0
     while True:
+        now = time.monotonic()
+        if now - last_recovery >= 30:
+            recover_stale_jobs()
+            last_recovery = now
+        if redis_client is None and now - last_redis_attempt >= REDIS_RECONNECT_SECONDS:
+            last_redis_attempt = now
+            try:
+                redis_client = connect_redis()
+                log.info("Connected to Redis Streams at configured REDIS_URL")
+            except Exception as exc:
+                log.warning("Redis Streams unavailable; using durable PostgreSQL polling: %s", exc)
+
+        did_work = False
         try:
             if redis_client is not None:
                 publish_pending_jobs(redis_client)
-                if consume_stream_once(redis_client):
-                    continue
-            if not process_one():
-                time.sleep(float(os.getenv("WORKER_POLL_SECONDS", "1")))
+                did_work = consume_stream_once(redis_client)
         except Exception as exc:
             if redis_client is not None:
                 log.warning("Redis Streams failed; falling back to PostgreSQL polling: %s", exc)
                 redis_client = None
-            else:
-                log.exception("Worker iteration failed")
-                time.sleep(1)
+                last_redis_attempt = time.monotonic()
+        if redis_client is None:
+            try:
+                did_work = process_one()
+            except Exception:
+                log.exception("PostgreSQL polling iteration failed")
+        if not did_work:
+            time.sleep(float(os.getenv("WORKER_POLL_SECONDS", "1")))
 
 
 if __name__ == "__main__":
