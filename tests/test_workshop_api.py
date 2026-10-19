@@ -72,6 +72,22 @@ def test_duplicate_registration_is_rejected_by_database_constraint(setup):
         assert db.scalar(select(func.count(NotificationJob.id))) == 1
 
 
+def test_registration_with_unknown_member_creates_no_records_or_notification(setup):
+    client, factory = setup
+    workshop = client.post("/workshops", json={"title": "Test workshop"})
+    assert workshop.status_code == 201
+
+    response = client.post(
+        "/registrations",
+        json={"workshop_id": workshop.json()["id"], "member_id": 999},
+    )
+
+    assert response.status_code == 404
+    with factory() as db:
+        assert db.scalar(select(func.count(Registration.id))) == 0
+        assert db.scalar(select(func.count(NotificationJob.id))) == 0
+
+
 def test_worker_retries_failure_then_succeeds(setup):
     client, factory = setup
     workshop_id, member_id = create_inputs(client)
