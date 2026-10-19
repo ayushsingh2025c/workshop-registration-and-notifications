@@ -13,8 +13,10 @@ os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
 from app.database import Base, get_db
 import app.main as main_module
 from app.main import app
+import app.mock_notification as mock_module
 from app.mock_notification import app as mock_app
 from app.models import DeliveryAttempt, NotificationJob, Registration, utcnow
+import app.worker as worker_module
 from app.worker import process_one, publish_pending_jobs, recover_stale_jobs
 
 
@@ -172,6 +174,75 @@ def test_mock_notification_failure_simulation_and_idempotency():
     repeated = client.post("/notify", json=payload, headers=headers)
     assert first.json()["duplicate"] is False
     assert repeated.json()["duplicate"] is True
+
+
+def test_mock_timeout_mode_sleeps_ten_seconds_then_returns_unknown_mode_error(monkeypatch):
+    sleeps = []
+    monkeypatch.setenv("MOCK_FAILURE_MODE", "timeout")
+    monkeypatch.setattr(mock_module.time, "sleep", sleeps.append)
+    client = TestClient(mock_app)
+
+    response = client.post(
+        "/notify",
+        json={
+            "job_id": 9002,
+            "notification_type": "confirmation",
+            "recipient": "timeout@example.com",
+            "workshop_title": "Mock workshop",
+        },
+        headers={"Idempotency-Key": "test-job-9002"},
+    )
+
+    assert sleeps == [10]
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown mock failure mode"
+
+
+def test_worker_retries_http_read_timeout_then_succeeds(setup, monkeypatch):
+    client, factory = setup
+    workshop_id, member_id = create_inputs(client)
+    job_id = client.post(
+        "/registrations", json={"workshop_id": workshop_id, "member_id": member_id}
+    ).json()["notification_job_id"]
+    requests = []
+
+    def post(*args, **kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            raise httpx.ReadTimeout(
+                "mock notification timed out",
+                request=httpx.Request("POST", args[0]),
+            )
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", args[0]),
+            json={"accepted": True, "duplicate": False},
+        )
+
+    monkeypatch.setenv("NOTIFICATION_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setattr(worker_module.httpx, "post", post)
+
+    assert process_one(factory)
+    with factory() as db:
+        job = db.get(NotificationJob, job_id)
+        attempt = db.scalar(select(DeliveryAttempt).where(DeliveryAttempt.job_id == job_id))
+        assert job.status == "pending" and job.attempts == 1
+        assert "timed out" in job.last_error
+        assert attempt.outcome == "retryable_error"
+        job.next_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+    assert process_one(factory)
+    with factory() as db:
+        job = db.get(NotificationJob, job_id)
+        attempts = db.scalars(
+            select(DeliveryAttempt)
+            .where(DeliveryAttempt.job_id == job_id)
+            .order_by(DeliveryAttempt.attempt_number)
+        ).all()
+        assert job.status == "succeeded" and job.attempts == 2
+        assert [attempt.outcome for attempt in attempts] == ["retryable_error", "success"]
+    assert [request["timeout"] for request in requests] == [0.05, 0.05]
 
 
 def test_cancellation_creates_one_job_per_registered_member_and_is_idempotent(setup):

@@ -50,9 +50,16 @@ In separate terminals, from the project folder:
 
 Open `http://127.0.0.1:8000/docs`. Create a member (`POST /members`) and workshop (`POST /workshops`), then register with `POST /registrations`. Check delivery using `GET /notification-jobs/{job_id}`. Cancel with `POST /workshops/{workshop_id}/cancel`.
 
-Set `MOCK_FAILURE_MODE=error` or `timeout` for mock-service failure simulation. The worker retries up to three times with exponential backoff, then records `failed`. Redis consumer groups distribute job IDs; the worker acknowledges only after the corresponding database state (success, terminal failure, or scheduled retry) is committed. It uses `XAUTOCLAIM` to recover idle pending stream entries and PostgreSQL startup/periodic recovery to reset stale processing claims. The outbox relay republishes due retry jobs. Delivery is at-least-once: stable idempotency keys are sent, but the mock's deduplication is process-local, so exactly-once external effects are not guaranteed.
+Set `MOCK_FAILURE_MODE=error` or `timeout` for mock-service failure simulation. The `timeout` mode sleeps for 10 seconds; with the worker's default 3-second HTTP timeout, the worker receives a client-side read timeout and records a retryable failure. If a caller waits through the full delay, the mock currently responds with HTTP 400 (`Unknown mock failure mode`). The worker retries up to three times with exponential backoff, then records `failed`. Redis consumer groups distribute job IDs; the worker acknowledges only after the corresponding database state (success, terminal failure, or scheduled retry) is committed. It uses `XAUTOCLAIM` to recover idle pending stream entries and PostgreSQL startup/periodic recovery to reset stale processing claims. The outbox relay republishes due retry jobs. Delivery is at-least-once: stable idempotency keys are sent, but the mock's deduplication is process-local, so exactly-once external effects are not guaranteed.
 
 For the complete PowerShell walkthrough of registration, duplicate rejection, notification failure/retry, cancellation fan-out, and worker-restart recovery, see [DEMO_GUIDE.md](DEMO_GUIDE.md). It also documents Redis Streams recovery and the PostgreSQL fallback.
+
+## Architecture and trade-offs
+
+- **Request latency and durability:** Registration and its confirmation job commit together in PostgreSQL. The API responds without waiting for notification delivery. PostgreSQL is authoritative; the worker's outbox relay publishes due jobs to Redis and can reconcile them when an `XADD` fails.
+- **Throughput:** Redis consumer groups can distribute jobs among workers, but each worker processes one job at a time. Overall throughput depends on worker count/configuration, database work, notification-service latency, and retry backoff; no throughput benchmark is claimed.
+- **Reliability and operations:** Durable records, retries, and restart recovery improve recovery from transient failures, but require operating PostgreSQL, Redis, and the worker. A notification failure is recorded for that job and scheduled for retry, allowing the worker to move on to other due jobs; a slow request still occupies its worker until the HTTP timeout.
+- **Delivery semantics:** Processing is at-least-once, so a notification may be attempted more than once. The worker sends a stable idempotency key, but the mock deduplicates only in process memory and resets that state on restart. Exactly-once external delivery is not guaranteed, particularly if a recipient accepts a notification before the worker records success.
 
 ## Tests
 
